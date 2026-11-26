@@ -59,6 +59,10 @@ class BaseModuleService:
         rows.append(entry)
         return entry, []
 
+    def create_failure_message(self, reasons: list[str]) -> str:
+        """登记失败时的提示：默认按缺字段措辞，领域服务可覆盖成具体校验原因。"""
+        return f"缺少必填字段：{'、'.join(reasons)}"
+
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(self.MODULE, entry_id)
         if entry is None:

@@ -28,6 +28,12 @@
       </span>
     </p>
 
+    <DelegatedReviewPanel
+      v-if="meta.key === 'field_parse'"
+      :initial-batch="defaultBatch"
+      :batch-options="batchOptions"
+    />
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -104,6 +110,7 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import DelegatedReviewPanel from '@/views/DelegatedReviewPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
@@ -115,6 +122,14 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const batchOptions = computed(() =>
+  Array.from(new Set(
+    rows.value
+      .map((row) => String(row['关联批次'] ?? ''))
+      .filter(Boolean),
+  )),
+)
+const defaultBatch = computed(() => batchOptions.value[0] ?? '')
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },

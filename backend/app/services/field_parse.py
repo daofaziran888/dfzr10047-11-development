@@ -20,8 +20,12 @@ class FieldParseService(BaseModuleService):
     def record_parsed_field(self, parse_no: str, intake_batch: str, template_no: str,
                             field_name: str, raw_value: str, parsed_value: str,
                             elapsed_ms: int, row_num: int,
-                            success: bool) -> dict[str, Any]:
-        """登记单字段解析结果，解析失败的字段连同行号可供坏行隔离消费。"""
+                            success: bool, sample_no: str = "",
+                            review_no: str = "") -> dict[str, Any]:
+        """登记单字段解析结果，解析失败的字段连同行号可供坏行隔离消费。
+
+        带上生效的样本编号与复核编号，产出的字段才能追到实际样本。
+        """
         rows = store.rows(self.MODULE)
         entry_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
         entry = {
@@ -37,9 +41,77 @@ class FieldParseService(BaseModuleService):
             "解析取值": parsed_value,
             "解析耗时": str(elapsed_ms),
             "解析行号": str(row_num),
+            "来源样本": sample_no,
+            "表头复核编号": review_no,
         }
         rows.append(entry)
         return entry
+
+    def claim_formal_parse(self, intake_batch: str, parse_no: str,
+                           template_no: str, claimant: str,
+                           claimed_at: str) -> tuple[bool, str, dict[str, Any] | None]:
+        """领取正式字段解析：先核对结构嗅探与表头复核的当前受理资格。
+
+        没有当前有效判定（委托撤销、被替换或从未受理）时拒绝领取，
+        并保证已受理的历史判定与起始行原样保留。
+        """
+        from app.services.schema_sniff import SchemaSniffService
+        from app.services.review_receipt import ReviewReceiptService
+
+        entitlement = SchemaSniffService().current_entitlement(intake_batch)
+        if not entitlement.get("可受理"):
+            return False, (
+                f"批次 {intake_batch} 不满足正式解析受理条件："
+                f"{entitlement.get('阻断原因')}"
+            ), None
+
+        existing = next(
+            (r for r in store.rows(self.MODULE)
+             if r.get("关联批次") == intake_batch and r.get("领取人标识")),
+            None)
+        if existing is not None:
+            return False, (
+                f"批次 {intake_batch} 已由 {existing.get('领取人标识')} 于 "
+                f"{existing.get('领取时间')} 领取正式解析，不得重复领取"
+            ), dict(existing)
+
+        rows = store.rows(self.MODULE)
+        entry = {
+            "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
+            "status": "解析中", "pending": True, "abnormal": False,
+            "解析编号": parse_no,
+            "关联批次": intake_batch,
+            "命中模板": template_no,
+            "字段名称": "",
+            "原始取值": "",
+            "解析取值": "",
+            "解析耗时": "0",
+            "解析行号": str(entitlement.get("起始行") or 1),
+            "来源样本": entitlement.get("样本编号"),
+            "表头复核编号": entitlement.get("复核编号"),
+            "领取人标识": claimant,
+            "领取时间": claimed_at,
+        }
+        rows.append(entry)
+
+        receipt_no = str(entitlement.get("回执编号") or "")
+        if receipt_no:
+            ReviewReceiptService().mark_actual_start(
+                receipt_no, int(entitlement.get("起始行") or 1), 0)
+        from app.services.parse_batch import ParseBatchService
+
+        ParseBatchService().record_start_row(
+            intake_batch,
+            int(entitlement.get("起始行") or 1),
+            str(entitlement.get("样本编号") or ""),
+            str(entitlement.get("复核编号") or ""),
+            claimed_at,
+        )
+        return True, (
+            f"批次 {intake_batch} 正式解析已由 {claimant} 领取："
+            f"按样本 {entitlement.get('样本编号')} 的判定从第 "
+            f"{entitlement.get('起始行')} 行开始，不重复写入第一条数据"
+        ), dict(entry)
 
     def failed_fields_of_batch(self, intake_batch: str) -> list[dict[str, Any]]:
         """输出解析失败字段清单（含行号），坏行隔离据此建隔离行。"""

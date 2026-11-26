@@ -2507,3 +2507,224 @@ class TestIntakeAuditAndServices:
         assert audits[-1]["变更后值"] == "探测格式xlsx"
         snap = audit_svc.domain_snapshot()
         assert snap["count"] >= 6
+
+
+# ======================================================================
+# 委托复核与表头判定：权限核验、起始行冲突、回执与正式解析领取
+# ======================================================================
+
+from app.services.delegated_review import DelegatedReviewService  # noqa: E402
+from app.services.header_review import HeaderReviewService  # noqa: E402
+from app.services.review_receipt import ReviewReceiptService  # noqa: E402
+
+
+class TestDelegatedHeaderReview:
+    BATCH = "FI-REVIEW-01"
+
+    def _setup(self, fresh_store, batch_id=None):
+        batch = batch_id or self.BATCH
+        store.rows("file_intake").append({
+            "id": 900, "status": "已入库", "pending": False, "abnormal": False,
+            "批次编号": batch, "来源渠道": "web-upload",
+            "原始文件名": f"{batch}.csv", "字节大小": "1024",
+            "投递时间": "2026-09-05T08:00:00", "文件后缀": ".csv",
+            "声明格式": "csv", "接收节点": "node-01"})
+        store.rows("parse_batch").append({
+            "id": 900, "status": "解析中", "pending": True, "abnormal": False,
+            "批次记录编号": f"PB-{batch}", "关联投递批次": batch,
+            "解析器标识": "csv_parser_v2", "总行数": "0", "成功行数": "0",
+            "隔离行数": "0", "批次状态": "进行中", "完成时间": ""})
+        store.rows("schema_sniff").append({
+            "id": 900, "status": "待嗅探", "pending": True, "abnormal": False,
+            "嗅探编号": f"SS-{batch}", "关联批次": batch, "样本行数": "0",
+            "推断列数": "0", "列名清单": "", "列类型推断": "",
+            "首行是否表头": "", "嗅探置信度": "0.00"})
+        return batch
+
+    def _delegate(self, batch, samples="S1,S2", no="DG-T1", delegatee="yi"):
+        ok, msg, row = DelegatedReviewService().create_delegation(
+            no, batch, "web-upload", samples, "jia", delegatee,
+            "2026-09-05T08:10:00")
+        assert ok, msg
+        return row
+
+    def test_valid_delegation_submits_and_issues_receipt(self, fresh_store):
+        batch = self._setup(fresh_store)
+        delegation = self._delegate(batch, samples="S1")
+        ok, msg, record = HeaderReviewService().submit_judgment(
+            batch, "S1", "yi", "有表头", 5, delegation_no="DG-T1",
+            submitted_at="2026-09-05T08:20:00")
+        assert ok, msg
+        assert record["起始行"] == "5"
+        assert record["回执编号"].startswith("RR-")
+        receipt = ReviewReceiptService().find(record["回执编号"])
+        assert receipt["授权凭据"] == delegation["授权凭据"]
+        assert receipt["样本范围"] == "S1"
+        assert receipt["实际解析起始行"] == "5"
+        assert receipt["回执状态"] == "有效"
+        # 结构嗅探与批次台账同步
+        sniff = next(r for r in store.rows("schema_sniff") if r["关联批次"] == batch)
+        assert sniff["确认起始行"] == "5"
+        assert sniff["表头复核编号"] == record["复核编号"]
+        batch_row = next(r for r in store.rows("parse_batch") if r["关联投递批次"] == batch)
+        assert batch_row["解析起始行"] == "5"
+        assert batch_row["起始行确认样本"] == "S1"
+
+    def test_unauthorized_submissions_keep_scope(self, fresh_store):
+        batch = self._setup(fresh_store)
+        self._delegate(batch, samples="S1")
+        reviews = HeaderReviewService()
+        sniff_before = [dict(r) for r in store.rows("schema_sniff")
+                        if r["关联批次"] == batch]
+        batch_before = [dict(r) for r in store.rows("parse_batch")
+                        if r["关联投递批次"] == batch]
+
+        # 受托人不符
+        ok1, msg1, rejected1 = reviews.submit_judgment(
+            batch, "S1", "bing", "有表头", 5, delegation_no="DG-T1",
+            submitted_at="t")
+        # 来源不符：用另一个来源的委托号校验
+        self._delegate(batch, no="DG-T2", samples="S1")
+        ok2, msg2, _ = reviews.submit_judgment(
+            batch, "S1", "yi", "有表头", 5, delegation_no="DG-T2",
+            source="sftp-node-99", submitted_at="t")
+        # 样本不在范围
+        ok3, msg3, rejected3 = reviews.submit_judgment(
+            batch, "S2", "yi", "有表头", 2, delegation_no="DG-T1",
+            submitted_at="t")
+        # 没有委托
+        ok4, msg4, _ = reviews.submit_judgment(
+            batch, "S1", "yi", "有表头", 5, delegation_no="DG-NONE",
+            submitted_at="t")
+
+        assert [ok1, ok2, ok3, ok4] == [False, False, False, False]
+        assert all("越权" in m for m in (msg1, msg2, msg3, msg4))
+        # 被拒提交留在原样本工作记录
+        assert rejected1["status"] == "已拒绝"
+        assert rejected1["样本编号"] == "S1"
+        records = reviews.records_of_sample(batch, "S1")
+        assert any(r["status"] == "已拒绝" for r in records)
+        assert rejected3["样本编号"] == "S2"
+        # 待解析范围不动
+        assert [r for r in store.rows("schema_sniff")
+                if r["关联批次"] == batch] == sniff_before
+        assert [r for r in store.rows("parse_batch")
+                if r["关联投递批次"] == batch] == batch_before
+        assert entitlement_of(batch)["可受理"] is False
+
+    def test_revoke_keeps_history_and_forces_read_only(self, fresh_store):
+        batch = self._setup(fresh_store)
+        self._delegate(batch, samples="S1", no="DG-T1")
+        reviews = HeaderReviewService()
+        ok, _m, record = reviews.submit_judgment(
+            batch, "S1", "yi", "有表头", 5, delegation_no="DG-T1",
+            submitted_at="2026-09-05T08:20:00")
+        assert ok
+
+        ok_revoke, msg, delegation = DelegatedReviewService().revoke_delegation(
+            "DG-T1", "jia", "2026-09-05T09:00:00", "领取前撤回")
+        assert ok_revoke, msg
+        assert delegation["status"] == "已撤销"
+
+        accepted = ReviewReceiptService().find(record["回执编号"])
+        assert accepted["回执状态"] == "只读"
+        assert accepted["起始行"] == "5"
+        assert accepted["实际解析起始行"] == "5"
+        history = reviews.find(record["复核编号"])
+        assert history["status"] == "已受理"
+        assert history["起始行"] == "5"
+        assert history["当前受理资格"] == "否"
+
+        entitlement = entitlement_of(batch)
+        assert entitlement["可受理"] is False
+        assert "撤销" in entitlement["阻断原因"] or "失效" in entitlement["阻断原因"]
+
+        ok_claim, claim_msg, _entry = SERVICES["field_parse"].claim_formal_parse(
+            batch, "FP-T1", "ET-001", "jia", "2026-09-05T09:05:00")
+        assert ok_claim is False
+        assert "不满足正式解析受理条件" in claim_msg
+
+    def test_conflicting_samples_and_current_entitlement(self, fresh_store):
+        batch = self._setup(fresh_store)
+        delegations = DelegatedReviewService()
+        delegations.create_delegation("DG-T1", batch, "web-upload", "S1",
+                                      "jia", "yi", "t0")
+        reviews = HeaderReviewService()
+        ok1, _m, first = reviews.submit_judgment(
+            batch, "S1", "yi", "有表头", 5, delegation_no="DG-T1", submitted_at="t1")
+        assert ok1
+
+        delegations.replace_delegation("DG-T1", "DG-T2", "S2", "jia", "t2",
+                                       delegatee="jia")
+        ok2, _m, second = reviews.submit_judgment(
+            batch, "S2", "jia", "有表头", 2, delegation_no="DG-T2",
+            submitted_at="t3")
+        assert ok2
+
+        conflict = reviews.conflict_of_batch(batch)
+        assert conflict is not None
+        assert "S1=5" in conflict["样本起始行"]
+        assert "S2=2" in conflict["样本起始行"]
+        # 历史判定不变
+        assert reviews.find(first["复核编号"])["起始行"] == "5"
+        assert reviews.find(first["复核编号"])["当前受理资格"] == "否"
+        assert ReviewReceiptService().find(first["回执编号"])["回执状态"] == "只读"
+        # 当前受理的是样本二
+        entitlement = entitlement_of(batch)
+        assert entitlement["可受理"] is True
+        assert entitlement["样本编号"] == "S2"
+        assert entitlement["起始行"] == 2
+        assert entitlement["回执编号"] == second["回执编号"]
+
+    def test_duplicate_approval_does_not_add_first_row(self, fresh_store):
+        batch = self._setup(fresh_store)
+        self._delegate(batch, samples="S1", no="DG-T1")
+        reviews = HeaderReviewService()
+        ok1, _m, first = reviews.submit_judgment(
+            batch, "S1", "yi", "有表头", 3, delegation_no="DG-T1", submitted_at="t1")
+        ok2, msg, again = reviews.submit_judgment(
+            batch, "S1", "yi", "有表头", 3, delegation_no="DG-T1", submitted_at="t2")
+        assert ok1 and ok2
+        assert again["复核编号"] == first["复核编号"]
+        assert "重复批准" in msg
+        assert len([r for r in store.rows("header_review")
+                    if r["关联批次"] == batch and r["status"] == "已受理"]) == 1
+        claimed, claim_msg, entry = SERVICES["field_parse"].claim_formal_parse(
+            batch, "FP-T1", "ET-001", "jia", "t3")
+        assert claimed, claim_msg
+        assert entry["解析行号"] == "3"
+        assert entry["来源样本"] == "S1"
+        # 只写一条领取记录，不重复写第一条数据
+        claims = [r for r in store.rows("field_parse")
+                  if r["关联批次"] == batch and r.get("领取人标识")]
+        assert len(claims) == 1
+        again_claim, _m2, _e = SERVICES["field_parse"].claim_formal_parse(
+            batch, "FP-T2", "ET-001", "bing", "t4")
+        assert again_claim is False
+
+    def test_receipt_opens_actual_start_row(self, fresh_store):
+        batch = self._setup(fresh_store)
+        self._delegate(batch, samples="S1", no="DG-T1")
+        _ok, _m, record = HeaderReviewService().submit_judgment(
+            batch, "S1", "yi", "有表头", 5, delegation_no="DG-T1", submitted_at="t1")
+        SERVICES["field_parse"].claim_formal_parse(batch, "FP-T1", "ET-001", "jia", "t2")
+        detail = ReviewReceiptService().verify(record["回执编号"])
+        assert detail["核对"]["实际解析起始行"] == 5
+        assert detail["核对"]["判定起始行"] == 5
+        assert detail["核对"]["结构嗅探起始行"] == 5
+        assert detail["核对"]["受理判定仍为当前"] is True
+        assert "照常受理" in detail["核对"]["核对结论"]
+
+    def test_no_header_sample_starts_at_one(self, fresh_store):
+        batch = self._setup(fresh_store)
+        self._delegate(batch, samples="S1", no="DG-T1")
+        ok, _m, record = HeaderReviewService().submit_judgment(
+            batch, "S1", "yi", "无表头", None, delegation_no="DG-T1", submitted_at="t1")
+        assert ok
+        assert record["起始行"] == "1"
+        assert entitlement_of(batch)["起始行"] == 1
+
+
+def entitlement_of(batch_id: str) -> dict:
+    """模拟字段解析领取前对结构嗅探受理资格的核对。"""
+    return SERVICES["schema_sniff"].current_entitlement(batch_id)

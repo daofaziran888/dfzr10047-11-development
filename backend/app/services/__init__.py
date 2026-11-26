@@ -21,6 +21,9 @@ from app.services.parse_watermark import ParseWatermarkService
 from app.services.reparse_task import ReparseTaskService
 from app.services.dup_fingerprint import DupFingerprintService
 from app.services.sample_review import SampleReviewService
+from app.services.delegated_review import DelegatedReviewService
+from app.services.header_review import HeaderReviewService
+from app.services.review_receipt import ReviewReceiptService
 from app.services.parse_metric import ParseMetricService
 from app.services.tmpl_diff import TmplDiffService
 from app.services.intake_audit import IntakeAuditService
@@ -45,6 +48,9 @@ SERVICES: dict[str, BaseModuleService] = {
     "reparse_task": ReparseTaskService(),
     "dup_fingerprint": DupFingerprintService(),
     "sample_review": SampleReviewService(),
+    "delegated_review": DelegatedReviewService(),
+    "header_review": HeaderReviewService(),
+    "review_receipt": ReviewReceiptService(),
     "parse_metric": ParseMetricService(),
     "tmpl_diff": TmplDiffService(),
     "intake_audit": IntakeAuditService(),

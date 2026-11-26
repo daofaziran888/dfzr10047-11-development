@@ -120,13 +120,99 @@ class SchemaSniffService(BaseModuleService):
         return status == "已推断", conclusion, dict(target)
 
     def parse_start_row(self, sniff_no: str) -> int:
-        """输出字段解析消费的起始行：表头行为 2，否则为 1。"""
+        """输出字段解析消费的起始行：表头复核确认的起始行优先于嗅探推断。"""
         for row in store.rows(self.MODULE):
-            if row.get("嗅探编号") == sniff_no:
-                if row.get("status") not in ("已推断",):
-                    return 1
-                return 2 if row.get("首行是否表头") == "是" else 1
+            if row.get("嗅探编号") != sniff_no:
+                continue
+            if row.get("status") not in ("已推断",):
+                return 1
+            confirmed = str(row.get("确认起始行") or "").strip()
+            if row.get("表头复核编号") and confirmed.isdigit():
+                return int(confirmed)
+            return 2 if row.get("首行是否表头") == "是" else 1
         return 1
+
+    # ------------------------------------------------------------------
+    # 表头复核联动：起始行以复核记录为准
+    # ------------------------------------------------------------------
+    def apply_header_review(self, batch_id: str, sample_no: str,
+                            header_present: bool, start_row: int,
+                            review_no: str,
+                            conflict: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """把已受理的表头判定写进结构嗅探记录，起始位置改由表头复核记录管理。"""
+        target = self._sniff_of_batch(batch_id)
+        if target is None:
+            rows = store.rows(self.MODULE)
+            target = {
+                "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
+                "嗅探编号": f"SS-{batch_id}",
+            }
+            rows.append(target)
+        target.update({
+            "关联批次": batch_id,
+            "首行是否表头": "是" if header_present else "否",
+            "确认起始行": str(start_row),
+            "表头复核编号": review_no,
+            "起始行确认样本": sample_no,
+            "起始行确认结果": (
+                f"样本 {sample_no} 判定{'有表头' if header_present else '无表头'}，"
+                f"解析起始行 {start_row}"
+            ),
+            "起始行冲突": (
+                conflict.get("样本起始行") if conflict else ""
+            ),
+            "status": "已推断",
+            "pending": False,
+            "abnormal": bool(conflict),
+        })
+        return dict(target)
+
+    def _sniff_of_batch(self, batch_id: str) -> dict[str, Any] | None:
+        for row in store.rows(self.MODULE):
+            if row.get("关联批次") == batch_id:
+                return row
+        return None
+
+    def entitlement_sniff_no(self, batch_id: str) -> str:
+        """返回批次当前用于判定受理资格的结构嗅探编号。"""
+        target = self._sniff_of_batch(batch_id)
+        return str(target.get("嗅探编号")) if target else ""
+
+    def current_entitlement(self, batch_id: str) -> dict[str, Any]:
+        """字段解析领取前核对的当前受理资格：只看表头复核记录的当前有效判定。"""
+        from app.services.header_review import HeaderReviewService
+
+        review_svc = HeaderReviewService()
+        current = review_svc.current_accepted(batch_id)
+        conflict = review_svc.conflict_of_batch(batch_id)
+        if current is None:
+            accepted = review_svc.accepted_of_batch(batch_id)
+            reason = (
+                "批次没有当前有效的表头复核判定，正式字段解析不得领取"
+                if not accepted else
+                "批次已受理的表头判定均已失效（委托撤销或被替换），需重新确认样本"
+            )
+            return {
+                "关联批次": batch_id,
+                "可受理": False,
+                "阻断原因": reason,
+                "复核编号": "",
+                "样本编号": "",
+                "起始行": None,
+                "起始行冲突": conflict,
+            }
+        return {
+            "关联批次": batch_id,
+            "可受理": True,
+            "阻断原因": "",
+            "复核编号": current.get("复核编号"),
+            "样本编号": current.get("样本编号"),
+            "起始行": int(str(current.get("起始行") or 1)),
+            "委托编号": current.get("委托编号"),
+            "受托人标识": current.get("受托人标识"),
+            "回执编号": current.get("回执编号"),
+            "起始行冲突": conflict,
+        }
 
     def blocks_field_parse(self, intake_batch: str) -> tuple[bool, str]:
         """推断冲突或低置信时不得启动字段解析。"""

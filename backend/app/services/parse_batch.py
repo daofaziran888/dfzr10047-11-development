@@ -56,6 +56,38 @@ class ParseBatchService(BaseModuleService):
             "unreviewed": sum(1 for r in rows if r.get("status") in ("已隔离", "复核中")),
         }
 
+    def record_start_row(self, intake_batch: str, start_row: int, sample_no: str,
+                         review_no: str, confirmed_at: str) -> tuple[bool, str, dict[str, Any] | None]:
+        """批次台账同步起始行确认结果：记录实际样本、复核编号与确认后的起始行。"""
+        batch = self._find_by_intake(intake_batch)
+        if batch is None:
+            return False, (
+                f"投递批次 {intake_batch} 没有对应批次记录，"
+                f"起始行确认结果暂记台账待补"
+            ), None
+        batch["解析起始行"] = str(start_row)
+        batch["起始行确认样本"] = sample_no
+        batch["表头复核编号"] = review_no
+        batch["起始行确认时间"] = confirmed_at
+        return True, (
+            f"批次 {intake_batch} 台账起始行已同步为 {start_row}"
+            f"（样本 {sample_no}，复核 {review_no}）"
+        ), dict(batch)
+
+    def header_ledger(self, intake_batch: str) -> dict[str, Any]:
+        """台账视图：起始行、确认样本与复核依据，产出的字段可追到实际样本。"""
+        batch = self._find_by_intake(intake_batch)
+        if batch is None:
+            return {"关联投递批次": intake_batch, "解析起始行": None}
+        return {
+            "批次记录编号": batch.get("批次记录编号"),
+            "关联投递批次": intake_batch,
+            "解析起始行": batch.get("解析起始行"),
+            "起始行确认样本": batch.get("起始行确认样本"),
+            "表头复核编号": batch.get("表头复核编号"),
+            "起始行确认时间": batch.get("起始行确认时间"),
+        }
+
     def refresh_batch_counts(self, intake_batch: str) -> tuple[bool, str, dict[str, Any] | None]:
         """按字段解析与坏行隔离的真实计数刷新批次行数，不允许人工填数。"""
         batch = self._find_by_intake(intake_batch)
